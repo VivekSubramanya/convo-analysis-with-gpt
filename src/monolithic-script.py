@@ -1,4 +1,4 @@
-# Monolithic MVP: Steps 1 → 3 with Diagnostics + Auto-K Selection
+# Monolithic MVP: Steps 1 → 3 with Diagnostics + Auto-K (Silhouette + Gini)
 # Dataset: thoughtvector/customer-support-on-twitter
 
 import os
@@ -15,7 +15,7 @@ from sentence_transformers import SentenceTransformer
 # Config
 # -------------------
 dataset = "thoughtvector/customer-support-on-twitter"
-row_limit = 10000  # keep up to 10k rows for embeddings + clustering
+row_limit = 10000  # cap rows for clustering
 
 # -------------------
 # Setup directories
@@ -59,7 +59,7 @@ if run_diag == "y":
         
         if num_unique == total:
             guess = "🆔 Likely an ID column (all values unique)"
-        elif col_dtype == "object" and df[col].str.len().mean() > 30:
+        elif col_dtype == "object" and df[col].astype(str).str.len().mean() > 30:
             guess = "✍️ Likely running text (long average length)"
         elif num_missing / total > 0.3:
             guess = f"⚠️ High nulls ({num_missing}/{total})"
@@ -98,85 +98,95 @@ for val in [x.strip() for x in user_input.split(",")]:
         if val in df.columns:
             columns_to_keep.append(val)
 
-# Check for at least one text-like column
-text_like_columns = [
-    col for col in columns_to_keep
-    if (df[col].dtype == "object") or ("text" in col.lower())
-]
-if not text_like_columns:
-    raise ValueError("❌ Must include at least one column with text data")
-
-print(f"\n✅ Keeping columns: {columns_to_keep}")
-print(f"✅ Found text column(s): {text_like_columns}")
-
-# -------------------
-# Step 2: Clean & Stage
-# -------------------
 df = df[columns_to_keep]
 df = df.dropna(how="all", subset=columns_to_keep)
 df = df.drop_duplicates()
-df = df.head(row_limit)
+
+# Random sample instead of head
+if len(df) > row_limit:
+    df = df.sample(n=row_limit, random_state=42)
+    print(f"🎲 Randomly sampled {row_limit} rows from dataset")
+else:
+    print(f"📉 Dataset smaller than {row_limit}, using all rows")
 
 staged_file = os.path.join(staging_dir, "cleaned_conversations.csv")
 df.to_csv(staged_file, index=False)
 print(f"✅ Staged dataset saved to {staged_file}")
 
 # -------------------
-# Step 3: Embeddings
+# Step 3: Choose Text Column for Clustering
 # -------------------
-text_col = text_like_columns[0]
+print("\nWhich column do you want to use for clustering (must be text-like)?")
+for i, col in enumerate(df.columns):
+    print(f"{i}: {col}")
+
+text_choice = input("Enter column name or number: ").strip()
+if text_choice.isdigit():
+    text_col = df.columns[int(text_choice)]
+else:
+    text_col = text_choice
+
+if text_col not in df.columns:
+    raise ValueError("❌ Invalid column choice.")
+
 print(f"\n📌 Using text column: {text_col}")
 
+# -------------------
+# Step 3: Embeddings
+# -------------------
 print("🔨 Generating embeddings...")
 model = SentenceTransformer("all-MiniLM-L6-v2")
-embeddings = model.encode(df[text_col].tolist(), show_progress_bar=True)
+embeddings = model.encode(df[text_col].astype(str).tolist(), show_progress_bar=True)
 
 n = len(df)
 print(f"\n📊 Dataset size for clustering: {n}")
 
 # -------------------
-# Step 3+: Auto-K Selection
+# Step 3+: Auto-K Selection (Inertia + Silhouette + Gini)
 # -------------------
-run_silhouette = False
-silhouette_sample_size = None
+def gini(array):
+    array = np.array(array)
+    if np.amin(array) < 0:
+        array -= np.amin(array)
+    array = array + 1e-10
+    array = np.sort(array)
+    n = array.shape[0]
+    cumx = np.cumsum(array)
+    return (n + 1 - 2 * np.sum(cumx) / cumx[-1]) / n
 
-if n * 0.1 > 10000:
-    print("⚡ Large dataset → Using Elbow (inertia) only, skipping silhouette.")
-else:
-    run_silhouette = True
-    if n * 0.05 >= 5000:
-        silhouette_sample_size = int(n * 0.05)
-    else:
-        silhouette_sample_size = min(n, 5000)
-    print(f"✅ Running silhouette on {silhouette_sample_size} sampled rows")
+k_range = range(5, 26)
+inertias, silhouettes, ginis = [], [], []
 
-k_values = [5, 10, 15, 20, 30, 50]
-results = []
-
-print("\n📊 Evaluating different K values...")
-for k in k_values:
+print("\n📊 Evaluating k values...")
+for k in k_range:
     kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
     labels = kmeans.fit_predict(embeddings)
-    
-    inertia = kmeans.inertia_
-    sil_score = None
-    
-    if run_silhouette:
-        sample_idx = random.sample(range(n), silhouette_sample_size)
-        sample_embeddings = embeddings[sample_idx]
-        sample_labels = labels[sample_idx]
-        sil_score = silhouette_score(sample_embeddings, sample_labels)
-    
-    results.append((k, inertia, sil_score))
-    print(f"K={k}: Inertia={inertia:.2f}, Silhouette={sil_score if sil_score else 'N/A'}")
 
-# Pick best K
-if run_silhouette:
-    best_k = max(results, key=lambda x: x[2])[0]
-    print(f"\n🏆 Best K (by silhouette): {best_k}")
+    inertia = kmeans.inertia_
+    inertias.append(inertia)
+
+    sil = silhouette_score(embeddings, labels, sample_size=2000, random_state=42)
+    silhouettes.append(sil)
+
+    g = gini(pd.Series(labels).value_counts().values)
+    ginis.append(g)
+
+    print(f"k={k:2d}: inertia={inertia:.2f}, silhouette={sil:.3f}, gini={g:.3f}")
+
+results = pd.DataFrame({
+    "k": list(k_range),
+    "inertia": inertias,
+    "silhouette": silhouettes,
+    "gini": ginis
+})
+
+valid = results[results["gini"] < 0.35]
+if not valid.empty:
+    best_k = int(valid.sort_values(by="silhouette", ascending=False).iloc[0]["k"])
+    print(f"\n🏆 Suggested best k: {best_k} (good silhouette + balanced clusters)")
 else:
-    best_k = 10
-    print(f"\n⚡ No silhouette run. Defaulting to K={best_k} (tune manually if needed).")
+    best_k = int(results.sort_values(by="silhouette", ascending=False).iloc[0]["k"])
+    print(f"\n⚠️ No k had gini < 0.35. Suggested best k by silhouette only: {best_k}")
 
 # -------------------
 # Step 3: Final Clustering
@@ -192,20 +202,22 @@ print(f"✅ Clustered dataset saved to {clustered_file}")
 # -------------------
 # Save evaluation plot
 # -------------------
-results_df = pd.DataFrame(results, columns=["k", "inertia", "silhouette_score"])
-plt.figure(figsize=(12,5))
+plt.figure(figsize=(15,5))
 
-plt.subplot(1,2,1)
-plt.plot(results_df["k"], results_df["inertia"], marker="o")
+plt.subplot(1,3,1)
+plt.plot(results["k"], results["inertia"], marker="o")
 plt.title("Elbow Method (Inertia)")
-plt.xlabel("k")
-plt.ylabel("Inertia")
+plt.xlabel("k"); plt.ylabel("Inertia")
 
-plt.subplot(1,2,2)
-plt.plot(results_df["k"], results_df["silhouette_score"], marker="o", color="orange")
-plt.title("Silhouette Score (sampled)" if run_silhouette else "Silhouette Skipped")
-plt.xlabel("k")
-plt.ylabel("Score")
+plt.subplot(1,3,2)
+plt.plot(results["k"], results["silhouette"], marker="o", color="orange")
+plt.title("Silhouette Score")
+plt.xlabel("k"); plt.ylabel("Score")
+
+plt.subplot(1,3,3)
+plt.plot(results["k"], results["gini"], marker="o", color="red")
+plt.title("Cluster Balance (Gini Index)")
+plt.xlabel("k"); plt.ylabel("Gini (lower is better)")
 
 plt.tight_layout()
 plot_file = os.path.join(staging_dir, "kmeans_autoK_eval.png")
