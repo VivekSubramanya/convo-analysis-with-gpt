@@ -1,0 +1,34 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# Data files and directories
+data/
+*.csv
+*.tsv
+*.xlsx
+
+# Virtual environment
+venv/
+env/
+ENV/
+
+# VS Code settings
+.vscode/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Python egg files
+*.egg
+*.egg-info/
+dist/
+build/
