@@ -1,5 +1,8 @@
-# Monolithic MVP: Steps 1 → 3 with Diagnostics + Auto-K (Silhouette + Gini)
+# Monolithic MVP: Steps 1 → 3 with Diagnostics + Auto-K + Subclustering
 # Dataset: thoughtvector/customer-support-on-twitter
+# Raw files → data/raw
+# Intermediate files → data/intermediate
+# Handles subdirectories in raw_dir + adds subclustering for vague clusters
 
 import os
 import kaggle
@@ -7,8 +10,10 @@ import pandas as pd
 import numpy as np
 import random
 import matplotlib.pyplot as plt
+import re
 from sklearn.cluster import KMeans
 from sklearn.metrics import silhouette_score
+from sklearn.feature_extraction.text import TfidfVectorizer
 from sentence_transformers import SentenceTransformer
 
 # -------------------
@@ -20,9 +25,10 @@ row_limit = 10000  # cap rows for clustering
 # -------------------
 # Setup directories
 # -------------------
-raw_dir = "data"
-staging_dir = os.path.join(raw_dir, "staging")
-os.makedirs(staging_dir, exist_ok=True)
+raw_dir = os.path.join("data", "raw")
+intermediate_dir = os.path.join("data", "intermediate")
+os.makedirs(raw_dir, exist_ok=True)
+os.makedirs(intermediate_dir, exist_ok=True)
 
 # -------------------
 # Step 1: Download Kaggle Dataset
@@ -32,14 +38,32 @@ kaggle.api.dataset_download_files(dataset, path=raw_dir, unzip=True)
 print(f"✅ Dataset downloaded and unzipped into {raw_dir}")
 
 # -------------------
-# Step 2: Load Raw CSV
+# Step 2: Let User Pick Which CSV to Use (recursive search)
 # -------------------
-csv_files = [f for f in os.listdir(raw_dir) if f.endswith(".csv")]
+csv_files = []
+for root, _, files in os.walk(raw_dir):
+    for f in files:
+        if f.endswith(".csv"):
+            rel_path = os.path.relpath(os.path.join(root, f), raw_dir)
+            csv_files.append(rel_path)
+
 if not csv_files:
     raise FileNotFoundError(f"No CSV files found in {raw_dir}")
-file_path = os.path.join(raw_dir, csv_files[0])
-print(f"\n📂 Using file: {file_path}")
 
+print("\n📂 CSV files available in data/raw (including subfolders):")
+for i, f in enumerate(csv_files):
+    size_mb = os.path.getsize(os.path.join(raw_dir, f)) / (1024 * 1024)
+    print(f"{i}: {f} ({size_mb:.2f} MB)")
+
+choice = input("\nEnter the number of the file you want to use: ").strip()
+if not choice.isdigit() or int(choice) >= len(csv_files):
+    raise ValueError("❌ Invalid choice.")
+file_path = os.path.join(raw_dir, csv_files[int(choice)])
+print(f"\n✅ Using file: {file_path}")
+
+# -------------------
+# Step 3: Load Raw CSV
+# -------------------
 df = pd.read_csv(file_path)
 
 # -------------------
@@ -77,7 +101,7 @@ if run_diag == "y":
     print(sample_row.to_dict())
 
 # -------------------
-# Step 2: Column Selection
+# Step 4: Column Selection
 # -------------------
 print("\nAvailable columns in dataset:")
 for i, col in enumerate(df.columns):
@@ -109,12 +133,8 @@ if len(df) > row_limit:
 else:
     print(f"📉 Dataset smaller than {row_limit}, using all rows")
 
-staged_file = os.path.join(staging_dir, "cleaned_conversations.csv")
-df.to_csv(staged_file, index=False)
-print(f"✅ Staged dataset saved to {staged_file}")
-
 # -------------------
-# Step 3: Choose Text Column for Clustering
+# Step 5: Choose Text Column
 # -------------------
 print("\nWhich column do you want to use for clustering (must be text-like)?")
 for i, col in enumerate(df.columns):
@@ -131,24 +151,39 @@ if text_col not in df.columns:
 
 print(f"\n📌 Using text column: {text_col}")
 
+# Keep raw + clean versions
+df["raw_text"] = df[text_col]
+
+def clean_text(txt):
+    txt = str(txt).lower()
+    txt = re.sub(r"@\w+", "", txt)       # remove @handles
+    txt = re.sub(r"#\w+", "", txt)       # remove hashtags
+    txt = re.sub(r"http\S+", "", txt)    # remove URLs
+    txt = re.sub(r"\d+", "", txt)        # remove numbers/codes
+    return txt.strip()
+
+df["clean_text"] = df[text_col].apply(clean_text)
+
+# Save staged cleaned dataset
+staged_file = os.path.join(intermediate_dir, "cleaned_conversations.csv")
+df.to_csv(staged_file, index=False)
+print(f"✅ Staged dataset saved to {staged_file}")
+
 # -------------------
-# Step 3: Embeddings
+# Step 6: Embeddings (on cleaned text)
 # -------------------
 print("🔨 Generating embeddings...")
 model = SentenceTransformer("all-MiniLM-L6-v2")
-embeddings = model.encode(df[text_col].astype(str).tolist(), show_progress_bar=True)
+embeddings = model.encode(df["clean_text"].astype(str).tolist(), show_progress_bar=True)
 
 n = len(df)
 print(f"\n📊 Dataset size for clustering: {n}")
 
 # -------------------
-# Step 3+: Auto-K Selection (Inertia + Silhouette + Gini)
+# Step 7: Auto-K Selection (Inertia + Silhouette + Gini)
 # -------------------
 def gini(array):
     array = np.array(array)
-    if np.amin(array) < 0:
-        array -= np.amin(array)
-    array = array + 1e-10
     array = np.sort(array)
     n = array.shape[0]
     cumx = np.cumsum(array)
@@ -165,7 +200,7 @@ for k in k_range:
     inertia = kmeans.inertia_
     inertias.append(inertia)
 
-    sil = silhouette_score(embeddings, labels, sample_size=2000, random_state=42)
+    sil = silhouette_score(embeddings, labels, sample_size=min(2000, n), random_state=42)
     silhouettes.append(sil)
 
     g = gini(pd.Series(labels).value_counts().values)
@@ -189,15 +224,55 @@ else:
     print(f"\n⚠️ No k had gini < 0.35. Suggested best k by silhouette only: {best_k}")
 
 # -------------------
-# Step 3: Final Clustering
+# Step 8: Final Clustering
 # -------------------
 print(f"\n🔗 Running final KMeans with k={best_k}...")
 kmeans = KMeans(n_clusters=best_k, random_state=42, n_init=10)
 df["cluster_id"] = kmeans.fit_predict(embeddings)
 
-clustered_file = os.path.join(staging_dir, "clustered_autoK.csv")
+# -------------------
+# Step 9: Subclustering for Vague Clusters
+# -------------------
+print("\n🪓 Checking for vague clusters to subcluster...")
+
+def keyword_diversity(texts, top_n=10):
+    vectorizer = TfidfVectorizer(stop_words="english", max_features=50, ngram_range=(1,2))
+    X = vectorizer.fit_transform(texts)
+    terms = vectorizer.get_feature_names_out()
+    return len(terms[:top_n])
+
+df["subcluster_id"] = -1  # default = no subdivision
+
+vague_clusters = []
+for cid in df["cluster_id"].unique():
+    cluster_texts = df[df["cluster_id"] == cid]["clean_text"].tolist()
+    if len(cluster_texts) > 500 or keyword_diversity(cluster_texts) > 7:
+        vague_clusters.append(cid)
+
+print(f"⚠️ Vague clusters detected: {vague_clusters}")
+
+for cid in vague_clusters:
+    cluster_df = df[df["cluster_id"] == cid]
+    texts = cluster_df["clean_text"].tolist()
+    emb = model.encode(texts, show_progress_bar=False)
+    
+    # small search range for sub-k
+    best_k, best_score = 2, -1
+    for k in range(2, 6):
+        kmeans_sub = KMeans(n_clusters=k, random_state=42, n_init=10).fit(emb)
+        score = silhouette_score(emb, kmeans_sub.labels_)
+        if score > best_score:
+            best_k, best_score = k, score
+    
+    kmeans_sub = KMeans(n_clusters=best_k, random_state=42, n_init=10).fit(emb)
+    df.loc[df["cluster_id"] == cid, "subcluster_id"] = kmeans_sub.labels_
+
+# -------------------
+# Step 10: Save Outputs
+# -------------------
+clustered_file = os.path.join(intermediate_dir, "clustered_with_subtopics.csv")
 df.to_csv(clustered_file, index=False)
-print(f"✅ Clustered dataset saved to {clustered_file}")
+print(f"✅ Clustered dataset with subtopics saved to {clustered_file}")
 
 # -------------------
 # Save evaluation plot
@@ -220,6 +295,6 @@ plt.title("Cluster Balance (Gini Index)")
 plt.xlabel("k"); plt.ylabel("Gini (lower is better)")
 
 plt.tight_layout()
-plot_file = os.path.join(staging_dir, "kmeans_autoK_eval.png")
+plot_file = os.path.join(intermediate_dir, "kmeans_autoK_eval.png")
 plt.savefig(plot_file)
 print(f"📊 Evaluation plot saved to {plot_file}")
